@@ -272,7 +272,18 @@ func (c *Controller) updateVolumeStatus(vmi *virtv1.VirtualMachineInstance, virt
 		return err
 	}
 
-	attachmentPod, _ := getActiveAndOldAttachmentPods(hotplugVolumes, attachmentPods)
+	attachmentVolumes := volumesForAttachmentPod(vmi, hotplugVolumes, attachmentPods)
+	attachmentPod, _ := getActiveAndOldAttachmentPods(attachmentVolumes, attachmentPods)
+	attachmentVolumeNames := make(map[string]struct{})
+	for _, volume := range attachmentVolumes {
+		attachmentVolumeNames[volume.Name] = struct{}{}
+	}
+	attachmentPodFor := func(volumeName string) *k8sv1.Pod {
+		if _, selected := attachmentVolumeNames[volumeName]; selected {
+			return attachmentPod
+		}
+		return nil
+	}
 
 	newStatus := make([]virtv1.VolumeStatus, 0)
 
@@ -310,7 +321,7 @@ func (c *Controller) updateVolumeStatus(vmi *virtv1.VirtualMachineInstance, virt
 		pvcName := storagetypes.PVCNameFromVirtVolume(&volume)
 
 		if _, ok := hotplugVolumesMap[volume.Name]; ok {
-			c.processHotplugVolumeStatus(vmi, volume.Name, pvcName, &status, attachmentPod)
+			c.processHotplugVolumeStatus(vmi, volume.Name, pvcName, &status, attachmentPodFor(volume.Name))
 		}
 		if volume.VolumeSource.PersistentVolumeClaim != nil || volume.VolumeSource.DataVolume != nil || volume.VolumeSource.MemoryDump != nil {
 			err = c.processPVCInfo(&status, pvcName, vmi.Namespace, false)
@@ -331,7 +342,7 @@ func (c *Controller) updateVolumeStatus(vmi *virtv1.VirtualMachineInstance, virt
 		}
 		// Remove from map so we can detect volumes removed from spec
 		delete(oldStatusMap, utilityVolume.Name)
-		c.processHotplugVolumeStatus(vmi, utilityVolume.Name, utilityVolume.ClaimName, &status, attachmentPod)
+		c.processHotplugVolumeStatus(vmi, utilityVolume.Name, utilityVolume.ClaimName, &status, attachmentPodFor(utilityVolume.Name))
 		err = c.processPVCInfo(&status, utilityVolume.ClaimName, vmi.Namespace, true)
 		if err != nil {
 			return err
