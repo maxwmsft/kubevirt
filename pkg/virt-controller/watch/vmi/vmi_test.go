@@ -4225,6 +4225,311 @@ var _ = Describe("VirtualMachineInstance watcher", func() {
 				},
 			}, true),
 		)
+
+		DescribeTable("should handle old running pod kept as fallback based on volume status", func(volName string, volPhase virtv1.VolumePhase, inSpec bool, expectDelete bool) {
+			vmi := watchtesting.NewRunningVirtualMachine("testvmi", &k8sv1.Node{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "testnode",
+				},
+			})
+			vmi.Status.VolumeStatus = []virtv1.VolumeStatus{
+				{
+					Name:  volName,
+					Phase: volPhase,
+					HotplugVolume: &virtv1.HotplugVolumeStatus{
+						AttachPodName: "old-pod",
+						AttachPodUID:  "old-uid",
+					},
+				},
+			}
+			if inSpec {
+				vmi.Spec.Volumes = []virtv1.Volume{
+					{
+						Name: volName,
+						VolumeSource: virtv1.VolumeSource{
+							PersistentVolumeClaim: &virtv1.PersistentVolumeClaimVolumeSource{
+								PersistentVolumeClaimVolumeSource: k8sv1.PersistentVolumeClaimVolumeSource{
+									ClaimName: volName + "-pvc",
+								},
+								Hotpluggable: true,
+							},
+						},
+					},
+				}
+			} else {
+				vmi.Spec.Volumes = []virtv1.Volume{}
+			}
+
+			readyVolumes := []*virtv1.Volume{{}}
+			oldPod := &k8sv1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "old-pod",
+					Namespace: vmi.Namespace,
+				},
+				Spec: k8sv1.PodSpec{
+					Volumes: []k8sv1.Volume{
+						{Name: volName},
+					},
+				},
+				Status: k8sv1.PodStatus{
+					Phase: k8sv1.PodRunning,
+				},
+			}
+			addPod(oldPod)
+
+			err := controller.cleanupAttachmentPods(nil, []*k8sv1.Pod{oldPod}, vmi, len(readyVolumes))
+			Expect(err).ToNot(HaveOccurred())
+			if expectDelete {
+				testutils.ExpectEvent(recorder, kvcontroller.SuccessfulDeletePodReason)
+				expectPodDoesNotExist(oldPod.Namespace, oldPod.Name)
+			} else {
+				expectPodExists(oldPod.Namespace, oldPod.Name)
+			}
+		},
+			Entry("should delete when all volumes are Detaching",
+				"detaching-vol", virtv1.HotplugVolumeDetaching, false, true),
+			Entry("should keep when volume is still in spec",
+				"active-vol", virtv1.VolumeReady, true, false),
+			Entry("should keep when removed volume is in deletion-blocking phase",
+				"blocking-vol", virtv1.VolumeReady, false, false),
+		)
+
+		It("should keep old running pod as fallback when it has both a Detaching and an in-spec volume", func() {
+			vmi := watchtesting.NewRunningVirtualMachine("testvmi", &k8sv1.Node{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "testnode",
+				},
+			})
+			vmi.Spec.Volumes = []virtv1.Volume{
+				{
+					Name: "active-vol",
+					VolumeSource: virtv1.VolumeSource{
+						PersistentVolumeClaim: &virtv1.PersistentVolumeClaimVolumeSource{
+							PersistentVolumeClaimVolumeSource: k8sv1.PersistentVolumeClaimVolumeSource{
+								ClaimName: "active-pvc",
+							},
+							Hotpluggable: true,
+						},
+					},
+				},
+			}
+			vmi.Status.VolumeStatus = []virtv1.VolumeStatus{
+				{
+					Name:  "detaching-vol",
+					Phase: virtv1.HotplugVolumeDetaching,
+					HotplugVolume: &virtv1.HotplugVolumeStatus{
+						AttachPodName: "old-pod",
+						AttachPodUID:  "old-uid",
+					},
+				},
+				{
+					Name:  "active-vol",
+					Phase: virtv1.VolumeReady,
+					HotplugVolume: &virtv1.HotplugVolumeStatus{
+						AttachPodName: "old-pod",
+						AttachPodUID:  "old-uid",
+					},
+				},
+			}
+
+			readyVolumes := []*virtv1.Volume{{}}
+			oldPod := &k8sv1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "old-pod",
+					Namespace: vmi.Namespace,
+				},
+				Spec: k8sv1.PodSpec{
+					Volumes: []k8sv1.Volume{
+						{Name: "detaching-vol"},
+						{Name: "active-vol"},
+					},
+				},
+				Status: k8sv1.PodStatus{
+					Phase: k8sv1.PodRunning,
+				},
+			}
+			addPod(oldPod)
+
+			err := controller.cleanupAttachmentPods(nil, []*k8sv1.Pod{oldPod}, vmi, len(readyVolumes))
+			Expect(err).ToNot(HaveOccurred())
+			expectPodExists(oldPod.Namespace, oldPod.Name)
+		})
+
+		DescribeTable("should clean up utility volume attachment pods when replacement pod is running",
+			func(includeUtilityPVC bool, includeUtilityMount bool, expectDelete bool) {
+				vmi := watchtesting.NewRunningVirtualMachine("testvmi", &k8sv1.Node{
+					ObjectMeta: metav1.ObjectMeta{
+						Name: "testnode",
+					},
+				})
+				vmi.Spec.UtilityVolumes = []virtv1.UtilityVolume{
+					{
+						Name: "utility-vol",
+						PersistentVolumeClaimVolumeSource: k8sv1.PersistentVolumeClaimVolumeSource{
+							ClaimName: "utility-pvc",
+						},
+					},
+				}
+				vmi.Status.VolumeStatus = []virtv1.VolumeStatus{
+					{
+						Name:  "utility-vol",
+						Phase: virtv1.HotplugVolumeMounted,
+						HotplugVolume: &virtv1.HotplugVolumeStatus{
+							AttachPodName: "new-pod",
+							AttachPodUID:  "new-uid",
+						},
+					},
+				}
+
+				oldPod := &k8sv1.Pod{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "old-pod",
+						Namespace: vmi.Namespace,
+					},
+					Spec: k8sv1.PodSpec{
+						Volumes: []k8sv1.Volume{
+							{
+								Name: "utility-vol",
+								VolumeSource: k8sv1.VolumeSource{
+									PersistentVolumeClaim: &k8sv1.PersistentVolumeClaimVolumeSource{
+										ClaimName: "utility-pvc",
+									},
+								},
+							},
+						},
+					},
+					Status: k8sv1.PodStatus{
+						Phase: k8sv1.PodRunning,
+					},
+				}
+
+				currentPodSpec := k8sv1.PodSpec{
+					Volumes: []k8sv1.Volume{
+						{
+							Name: "hotplug-vol",
+							VolumeSource: k8sv1.VolumeSource{
+								PersistentVolumeClaim: &k8sv1.PersistentVolumeClaimVolumeSource{
+									ClaimName: "hotplug-pvc",
+								},
+							},
+						},
+					},
+				}
+				if includeUtilityPVC {
+					currentPodSpec.Volumes = append([]k8sv1.Volume{
+						{
+							Name: "utility-vol",
+							VolumeSource: k8sv1.VolumeSource{
+								PersistentVolumeClaim: &k8sv1.PersistentVolumeClaimVolumeSource{
+									ClaimName: "utility-pvc",
+								},
+							},
+						},
+					}, currentPodSpec.Volumes...)
+				}
+				if includeUtilityMount {
+					currentPodSpec.Containers = []k8sv1.Container{
+						{
+							Name: "hotplug-disk",
+							VolumeMounts: []k8sv1.VolumeMount{
+								{
+									Name:      "utility-vol",
+									MountPath: "/utility-vol",
+								},
+							},
+						},
+					}
+				}
+				currentPod := &k8sv1.Pod{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "new-pod",
+						Namespace: vmi.Namespace,
+					},
+					Spec: currentPodSpec,
+					Status: k8sv1.PodStatus{
+						Phase: k8sv1.PodRunning,
+					},
+				}
+
+				addPod(oldPod)
+
+				err := controller.cleanupAttachmentPods(currentPod, []*k8sv1.Pod{oldPod}, vmi, 2)
+				Expect(err).ToNot(HaveOccurred())
+				if expectDelete {
+					testutils.ExpectEvent(recorder, kvcontroller.SuccessfulDeletePodReason)
+					expectPodDoesNotExist(oldPod.Namespace, oldPod.Name)
+				} else {
+					expectPodExists(oldPod.Namespace, oldPod.Name)
+				}
+			},
+			Entry("delete when replacement exposes utility volume", true, true, true),
+			Entry("keep when replacement is missing utility volume", false, false, false),
+			Entry("keep when replacement has utility PVC without container mount", true, false, false),
+		)
+
+		DescribeTable("volumeHandledByCurrentPod",
+			func(currentPod *k8sv1.Pod, volumeName string, specVolumes map[string]struct{}, expected bool) {
+				Expect(volumeHandledByCurrentPod(volumeName, currentPod, specVolumes)).To(Equal(expected))
+			},
+			Entry("nil pod", nil, "vol", map[string]struct{}{"vol": {}}, false),
+			Entry("pending pod", &k8sv1.Pod{Status: k8sv1.PodStatus{Phase: k8sv1.PodPending}}, "vol", map[string]struct{}{"vol": {}}, false),
+			Entry("volume not in spec map", &k8sv1.Pod{Status: k8sv1.PodStatus{Phase: k8sv1.PodRunning}}, "vol", map[string]struct{}{}, false),
+			Entry("pvc without container mount", &k8sv1.Pod{
+				Status: k8sv1.PodStatus{Phase: k8sv1.PodRunning},
+				Spec: k8sv1.PodSpec{
+					Volumes: []k8sv1.Volume{
+						{
+							Name: "vol",
+							VolumeSource: k8sv1.VolumeSource{
+								PersistentVolumeClaim: &k8sv1.PersistentVolumeClaimVolumeSource{ClaimName: "pvc"},
+							},
+						},
+					},
+				},
+			}, "vol", map[string]struct{}{"vol": {}}, false),
+			Entry("pvc with volume mount", &k8sv1.Pod{
+				Status: k8sv1.PodStatus{Phase: k8sv1.PodRunning},
+				Spec: k8sv1.PodSpec{
+					Containers: []k8sv1.Container{
+						{
+							Name: "hotplug-disk",
+							VolumeMounts: []k8sv1.VolumeMount{
+								{Name: "vol", MountPath: "/vol"},
+							},
+						},
+					},
+					Volumes: []k8sv1.Volume{
+						{
+							Name: "vol",
+							VolumeSource: k8sv1.VolumeSource{
+								PersistentVolumeClaim: &k8sv1.PersistentVolumeClaimVolumeSource{ClaimName: "pvc"},
+							},
+						},
+					},
+				},
+			}, "vol", map[string]struct{}{"vol": {}}, true),
+			Entry("pvc with volume device", &k8sv1.Pod{
+				Status: k8sv1.PodStatus{Phase: k8sv1.PodRunning},
+				Spec: k8sv1.PodSpec{
+					Containers: []k8sv1.Container{
+						{
+							Name: "hotplug-disk",
+							VolumeDevices: []k8sv1.VolumeDevice{
+								{Name: "vol", DevicePath: "/path/vol/uid"},
+							},
+						},
+					},
+					Volumes: []k8sv1.Volume{
+						{
+							Name: "vol",
+							VolumeSource: k8sv1.VolumeSource{
+								PersistentVolumeClaim: &k8sv1.PersistentVolumeClaimVolumeSource{ClaimName: "pvc"},
+							},
+						},
+					},
+				},
+			}, "vol", map[string]struct{}{"vol": {}}, true),
+		)
 	})
 
 	Context("topology hints", func() {
