@@ -3891,6 +3891,374 @@ var _ = Describe("VirtualMachineInstance watcher", func() {
 				Expect(controller.pvcIndexer.Add(pvc)).To(Succeed())
 			}
 
+			Context("during a staged attachment pod handoff", func() {
+				var createdPods []*k8sv1.Pod
+
+				BeforeEach(func() {
+					createdPods = nil
+					kubeClient.Fake.PrependReactor("create", "pods", func(action testing.Action) (bool, k8sruntime.Object, error) {
+						pod := action.(testing.CreateAction).GetObject().(*k8sv1.Pod)
+						if pod.GenerateName == "hp-volume-" {
+							pod.Namespace = action.GetNamespace()
+							pod.Name = fmt.Sprintf("hp-volume-%d", len(createdPods))
+							pod.UID = types.UID(pod.Name)
+							pod.Status.Phase = k8sv1.PodPending
+							createdPods = append(createdPods, pod.DeepCopy())
+						}
+						return false, nil, nil
+					})
+				})
+
+				newHandoff := func(name, outgoing, incoming string) (*virtv1.VirtualMachineInstance, *k8sv1.Pod, *k8sv1.Pod) {
+					vmi := newPendingVirtualMachine(name)
+					vmi.UID = types.UID(name)
+					vmi.Status.SelinuxContext = "none"
+					retained := name + "-retained"
+					vmi.Spec.Volumes = []virtv1.Volume{hotplugPVC(retained), hotplugPVC(incoming)}
+					launcher := newPodForVirtualMachine(vmi, k8sv1.PodRunning)
+					launcher.Name = name + "-launcher"
+					launcher.UID = types.UID(launcher.Name)
+					launcher.Spec.NodeName = name + "-node"
+					oldPod := readyPodServing(launcher, name+"-old", name+"-old-uid", retained, outgoing)
+					oldPod.Spec.NodeName = launcher.Spec.NodeName
+					for _, volumeName := range []string{retained, outgoing} {
+						vmi.Status.VolumeStatus = append(vmi.Status.VolumeStatus, virtv1.VolumeStatus{
+							Name:  volumeName,
+							Phase: virtv1.VolumeReady,
+							HotplugVolume: &virtv1.HotplugVolumeStatus{
+								AttachPodName: oldPod.Name,
+								AttachPodUID:  oldPod.UID,
+							},
+						})
+					}
+					addVirtualMachine(vmi)
+					addPod(launcher)
+					addPod(oldPod)
+					addBoundPVC(retained)
+					addBoundPVC(incoming)
+					return vmi, launcher, oldPod
+				}
+
+				reconcile := func(vmi *virtv1.VirtualMachineInstance, launcher *k8sv1.Pod) {
+					pods, err := kvcontroller.AttachmentPods(launcher, controller.podIndexer)
+					Expect(err).ToNot(HaveOccurred())
+					Expect(controller.handleHotplugVolumes(storagetypes.GetHotplugVolumes(vmi, launcher), pods, vmi, launcher, nil)).To(Succeed())
+				}
+
+				observeRunning := func(pod *k8sv1.Pod) {
+					pod.Status.Phase = k8sv1.PodRunning
+					pod.Status.ContainerStatuses = []k8sv1.ContainerStatus{{Ready: true}}
+					Expect(controller.podIndexer.Update(pod)).To(Succeed())
+				}
+
+				unmountOutgoing := func(vmi *virtv1.VirtualMachineInstance, name string) {
+					index := slices.IndexFunc(vmi.Status.VolumeStatus, func(status virtv1.VolumeStatus) bool { return status.Name == name })
+					Expect(index).To(BeNumerically(">=", 0))
+					vmi.Status.VolumeStatus[index].Phase = virtv1.HotplugVolumeDetaching
+				}
+
+				It("Should converge reciprocal volume moves without dropping retained volumes", func() {
+					vmiA, launcherA, oldA := newHandoff("vm-a", "disk-a", "disk-b")
+					vmiB, launcherB, oldB := newHandoff("vm-b", "disk-b", "disk-a")
+					blockedA := readyPodServing(launcherA, "blocked-a", "blocked-a-uid", "vm-a-retained", "disk-b")
+					blockedB := readyPodServing(launcherB, "blocked-b", "blocked-b-uid", "vm-b-retained", "disk-a")
+					for _, pod := range []*k8sv1.Pod{blockedA, blockedB} {
+						pod.Status.Phase = k8sv1.PodPending
+						pod.Status.ContainerStatuses = nil
+						addPod(pod)
+					}
+
+					By("discarding replacements that are waiting for each other's outgoing claim")
+					reconcile(vmiA, launcherA)
+					reconcile(vmiB, launcherB)
+					testutils.ExpectEvents(recorder, kvcontroller.SuccessfulDeletePodReason, kvcontroller.SuccessfulDeletePodReason)
+					Expect(createdPods).To(BeEmpty())
+					for _, pod := range []*k8sv1.Pod{blockedA, blockedB} {
+						expectPodDoesNotExist(pod.Namespace, pod.Name)
+						Expect(controller.podIndexer.Delete(pod)).To(Succeed())
+					}
+
+					By("creating replacements with only claims already held on each node")
+					reconcile(vmiA, launcherA)
+					reconcile(vmiB, launcherB)
+					testutils.ExpectEvents(recorder, kvcontroller.SuccessfulCreatePodReason, kvcontroller.SuccessfulCreatePodReason)
+					Expect(createdPods).To(HaveLen(2))
+					stagedA, stagedB := createdPods[0], createdPods[1]
+					Expect(podVolumesMatchesReadyVolumes(stagedA, []*virtv1.Volume{&vmiA.Spec.Volumes[0]})).To(BeTrue())
+					Expect(podVolumesMatchesReadyVolumes(stagedB, []*virtv1.Volume{&vmiB.Spec.Volumes[0]})).To(BeTrue())
+					for _, pod := range []*k8sv1.Pod{stagedA, stagedB} {
+						Expect(controller.podIndexer.Add(pod)).To(Succeed())
+					}
+					for range 2 {
+						reconcile(vmiA, launcherA)
+						reconcile(vmiB, launcherB)
+						Expect(createdPods).To(HaveLen(2))
+						expectPodExists(oldA.Namespace, oldA.Name)
+						expectPodExists(oldB.Namespace, oldB.Name)
+					}
+
+					By("keeping retained volume status on the staged replacement, not on incoming claims")
+					observeRunning(stagedA)
+					observeRunning(stagedB)
+					Expect(controller.updateVolumeStatus(vmiA, launcherA, nil)).To(Succeed())
+					Expect(controller.updateVolumeStatus(vmiB, launcherB, nil)).To(Succeed())
+					Expect(vmiA.Status.VolumeStatus).To(ContainElements(
+						And(HaveField("Name", "vm-a-retained"), HaveField("Phase", virtv1.VolumeReady), HaveField("HotplugVolume.AttachPodUID", stagedA.UID)),
+						And(HaveField("Name", "disk-b"), HaveField("Phase", virtv1.VolumeBound), HaveField("HotplugVolume.AttachPodUID", BeEmpty())),
+					))
+					Expect(vmiB.Status.VolumeStatus).To(ContainElements(
+						And(HaveField("Name", "vm-b-retained"), HaveField("Phase", virtv1.VolumeReady), HaveField("HotplugVolume.AttachPodUID", stagedB.UID)),
+						And(HaveField("Name", "disk-a"), HaveField("Phase", virtv1.VolumeBound), HaveField("HotplugVolume.AttachPodUID", BeEmpty())),
+					))
+					reconcile(vmiA, launcherA)
+					reconcile(vmiB, launcherB)
+					expectPodExists(oldA.Namespace, oldA.Name)
+					expectPodExists(oldB.Namespace, oldB.Name)
+
+					By("waiting for outgoing guest volumes to unmount before releasing the old helpers")
+					unmountOutgoing(vmiA, "disk-a")
+					unmountOutgoing(vmiB, "disk-b")
+					reconcile(vmiA, launcherA)
+					reconcile(vmiB, launcherB)
+					testutils.ExpectEvents(recorder, kvcontroller.SuccessfulDeletePodReason, kvcontroller.SuccessfulDeletePodReason)
+					for _, pod := range []*k8sv1.Pod{oldA, oldB} {
+						expectPodDoesNotExist(pod.Namespace, pod.Name)
+						pod.DeletionTimestamp = new(metav1.Now())
+						Expect(controller.podIndexer.Update(pod)).To(Succeed())
+					}
+					reconcile(vmiA, launcherA)
+					reconcile(vmiB, launcherB)
+					Expect(createdPods).To(HaveLen(2))
+					for _, pod := range []*k8sv1.Pod{oldA, oldB} {
+						Expect(controller.podIndexer.Delete(pod)).To(Succeed())
+					}
+
+					By("adding incoming claims only after both outgoing holders have disappeared")
+					reconcile(vmiA, launcherA)
+					reconcile(vmiB, launcherB)
+					testutils.ExpectEvents(recorder, kvcontroller.SuccessfulCreatePodReason, kvcontroller.SuccessfulCreatePodReason)
+					Expect(createdPods).To(HaveLen(4))
+					fullA, fullB := createdPods[2], createdPods[3]
+					Expect(podVolumesMatchesReadyVolumes(fullA, storagetypes.GetHotplugVolumes(vmiA, launcherA))).To(BeTrue())
+					Expect(podVolumesMatchesReadyVolumes(fullB, storagetypes.GetHotplugVolumes(vmiB, launcherB))).To(BeTrue())
+					for _, pod := range []*k8sv1.Pod{fullA, fullB} {
+						Expect(controller.podIndexer.Add(pod)).To(Succeed())
+					}
+					reconcile(vmiA, launcherA)
+					reconcile(vmiB, launcherB)
+					Expect(createdPods).To(HaveLen(4))
+					expectPodExists(stagedA.Namespace, stagedA.Name)
+					expectPodExists(stagedB.Namespace, stagedB.Name)
+
+					observeRunning(fullA)
+					observeRunning(fullB)
+					Expect(controller.updateVolumeStatus(vmiA, launcherA, nil)).To(Succeed())
+					Expect(controller.updateVolumeStatus(vmiB, launcherB, nil)).To(Succeed())
+					testutils.ExpectEvents(recorder, kvcontroller.SuccessfulCreatePodReason, kvcontroller.SuccessfulCreatePodReason)
+					Expect(vmiA.Status.VolumeStatus).To(ContainElement(And(
+						HaveField("Name", "disk-b"), HaveField("Phase", virtv1.HotplugVolumeAttachedToNode), HaveField("HotplugVolume.AttachPodUID", fullA.UID),
+					)))
+					Expect(vmiB.Status.VolumeStatus).To(ContainElement(And(
+						HaveField("Name", "disk-a"), HaveField("Phase", virtv1.HotplugVolumeAttachedToNode), HaveField("HotplugVolume.AttachPodUID", fullB.UID),
+					)))
+					reconcile(vmiA, launcherA)
+					reconcile(vmiB, launcherB)
+					testutils.ExpectEvents(recorder, kvcontroller.SuccessfulDeletePodReason, kvcontroller.SuccessfulDeletePodReason)
+					expectPodDoesNotExist(stagedA.Namespace, stagedA.Name)
+					expectPodDoesNotExist(stagedB.Namespace, stagedB.Name)
+				})
+
+				It("Should preserve every retained claim while the intermediate helper is pending", func() {
+					vmi, launcher, oldPod := newHandoff("vm-a", "disk-a", "disk-b")
+					oldPod.CreationTimestamp = metav1.NewTime(time.Now().Add(-2 * time.Hour))
+					Expect(controller.podIndexer.Update(oldPod)).To(Succeed())
+					vmi.Spec.Volumes = append(vmi.Spec.Volumes, hotplugPVC("second-retained"))
+					addBoundPVC("second-retained")
+					recentPod := readyPodServing(launcher, "recent-old", "recent-old-uid", "second-retained", "disk-c")
+					recentPod.CreationTimestamp = metav1.NewTime(time.Now().Add(-time.Hour))
+					addPod(recentPod)
+					for _, volumeName := range []string{"second-retained", "disk-c"} {
+						addVolumeStatuses(vmi, virtv1.VolumeStatus{
+							Name:  volumeName,
+							Phase: virtv1.VolumeReady,
+							HotplugVolume: &virtv1.HotplugVolumeStatus{
+								AttachPodName: recentPod.Name,
+								AttachPodUID:  recentPod.UID,
+							},
+						})
+					}
+					unmountOutgoing(vmi, "disk-a")
+					unmountOutgoing(vmi, "disk-c")
+
+					reconcile(vmi, launcher)
+					testutils.ExpectEvent(recorder, kvcontroller.SuccessfulCreatePodReason)
+					Expect(createdPods).To(HaveLen(1))
+					Expect(createdPods[0].Spec.Volumes).To(ContainElements(
+						HaveField("Name", "vm-a-retained"), HaveField("Name", "second-retained"),
+					))
+					Expect(createdPods[0].Spec.Volumes).ToNot(ContainElement(HaveField("Name", "disk-b")))
+					expectPodExists(oldPod.Namespace, oldPod.Name)
+					expectPodExists(recentPod.Namespace, recentPod.Name)
+
+					observeRunning(createdPods[0])
+					Expect(controller.updateVolumeStatus(vmi, launcher, nil)).To(Succeed())
+					reconcile(vmi, launcher)
+					testutils.ExpectEvents(recorder, kvcontroller.SuccessfulDeletePodReason, kvcontroller.SuccessfulDeletePodReason)
+					expectPodDoesNotExist(oldPod.Namespace, oldPod.Name)
+					expectPodDoesNotExist(recentPod.Namespace, recentPod.Name)
+				})
+
+				DescribeTable("Should recover a reciprocal handoff after prolonged CSI unavailability", func(delay time.Duration) {
+					vmiA, launcherA, oldA := newHandoff("vm-a", "disk-a", "disk-b")
+					vmiB, launcherB, oldB := newHandoff("vm-b", "disk-b", "disk-a")
+					incomingA, incomingB := vmiA.Spec.Volumes[1], vmiB.Spec.Volumes[1]
+					vmiA.Spec.Volumes = vmiA.Spec.Volumes[:1]
+					vmiB.Spec.Volumes = vmiB.Spec.Volumes[:1]
+					unmountOutgoing(vmiA, "disk-a")
+					unmountOutgoing(vmiB, "disk-b")
+
+					By("creating retained-only replacements before incoming requests arrive")
+					reconcile(vmiA, launcherA)
+					reconcile(vmiB, launcherB)
+					testutils.ExpectEvents(recorder, kvcontroller.SuccessfulCreatePodReason, kvcontroller.SuccessfulCreatePodReason)
+					Expect(createdPods).To(HaveLen(2))
+					stagedA, stagedB := createdPods[0], createdPods[1]
+					for _, pod := range []*k8sv1.Pod{stagedA, stagedB} {
+						Expect(controller.podIndexer.Add(pod)).To(Succeed())
+					}
+					vmiA.Spec.Volumes = append(vmiA.Spec.Volumes, incomingA)
+					vmiB.Spec.Volumes = append(vmiB.Spec.Volumes, incomingB)
+
+					By("keeping retained disks served while CSI cannot mount the replacements")
+					// Model Pod age and repeated reconciles, not a real CSI driver or wall-clock wait.
+					for elapsed := time.Minute; elapsed <= delay; elapsed += time.Minute {
+						for _, pod := range []*k8sv1.Pod{stagedA, stagedB} {
+							pod.CreationTimestamp = metav1.NewTime(time.Now().Add(-elapsed))
+							Expect(controller.podIndexer.Update(pod)).To(Succeed())
+						}
+						vmiA, vmiB = vmiA.DeepCopy(), vmiB.DeepCopy()
+						reconcile(vmiA, launcherA)
+						reconcile(vmiB, launcherB)
+						Expect(controller.updateVolumeStatus(vmiA, launcherA, nil)).To(Succeed())
+						Expect(controller.updateVolumeStatus(vmiB, launcherB, nil)).To(Succeed())
+						Expect(createdPods).To(HaveLen(2))
+						for _, pod := range []*k8sv1.Pod{oldA, oldB, stagedA, stagedB} {
+							expectPodExists(pod.Namespace, pod.Name)
+						}
+						Expect(vmiA.Status.VolumeStatus).To(ContainElements(
+							And(HaveField("Name", "vm-a-retained"), HaveField("Phase", virtv1.VolumeReady)),
+							And(HaveField("Name", "disk-b"), HaveField("Phase", virtv1.VolumeBound), HaveField("HotplugVolume.AttachPodUID", BeEmpty())),
+						))
+						Expect(vmiB.Status.VolumeStatus).To(ContainElements(
+							And(HaveField("Name", "vm-b-retained"), HaveField("Phase", virtv1.VolumeReady)),
+							And(HaveField("Name", "disk-a"), HaveField("Phase", virtv1.VolumeBound), HaveField("HotplugVolume.AttachPodUID", BeEmpty())),
+						))
+					}
+
+					By("releasing outgoing claims only once CSI has mounted the retained-only helpers")
+					observeRunning(stagedA)
+					observeRunning(stagedB)
+					Expect(controller.updateVolumeStatus(vmiA, launcherA, nil)).To(Succeed())
+					Expect(controller.updateVolumeStatus(vmiB, launcherB, nil)).To(Succeed())
+					reconcile(vmiA, launcherA)
+					reconcile(vmiB, launcherB)
+					testutils.ExpectEvents(recorder, kvcontroller.SuccessfulDeletePodReason, kvcontroller.SuccessfulDeletePodReason)
+					for _, pod := range []*k8sv1.Pod{oldA, oldB} {
+						expectPodDoesNotExist(pod.Namespace, pod.Name)
+						Expect(controller.podIndexer.Delete(pod)).To(Succeed())
+					}
+
+					By("finishing the incoming attachments without operator intervention")
+					reconcile(vmiA, launcherA)
+					reconcile(vmiB, launcherB)
+					testutils.ExpectEvents(recorder, kvcontroller.SuccessfulCreatePodReason, kvcontroller.SuccessfulCreatePodReason)
+					Expect(createdPods).To(HaveLen(4))
+					fullA, fullB := createdPods[2], createdPods[3]
+					Expect(podVolumesMatchesReadyVolumes(fullA, storagetypes.GetHotplugVolumes(vmiA, launcherA))).To(BeTrue())
+					Expect(podVolumesMatchesReadyVolumes(fullB, storagetypes.GetHotplugVolumes(vmiB, launcherB))).To(BeTrue())
+					observeRunning(fullA)
+					observeRunning(fullB)
+					Expect(controller.updateVolumeStatus(vmiA, launcherA, nil)).To(Succeed())
+					Expect(controller.updateVolumeStatus(vmiB, launcherB, nil)).To(Succeed())
+					testutils.ExpectEvents(recorder, kvcontroller.SuccessfulCreatePodReason, kvcontroller.SuccessfulCreatePodReason)
+					Expect(vmiA.Status.VolumeStatus).To(ContainElement(And(
+						HaveField("Name", "disk-b"), HaveField("Phase", virtv1.HotplugVolumeAttachedToNode), HaveField("HotplugVolume.AttachPodUID", fullA.UID),
+					)))
+					Expect(vmiB.Status.VolumeStatus).To(ContainElement(And(
+						HaveField("Name", "disk-a"), HaveField("Phase", virtv1.HotplugVolumeAttachedToNode), HaveField("HotplugVolume.AttachPodUID", fullB.UID),
+					)))
+					Expect(vmiA.Status.VolumeStatus).ToNot(ContainElement(HaveField("Name", "disk-a")))
+					Expect(vmiB.Status.VolumeStatus).ToNot(ContainElement(HaveField("Name", "disk-b")))
+					reconcile(vmiA, launcherA)
+					reconcile(vmiB, launcherB)
+					testutils.ExpectEvents(recorder, kvcontroller.SuccessfulDeletePodReason, kvcontroller.SuccessfulDeletePodReason)
+					expectPodDoesNotExist(stagedA.Namespace, stagedA.Name)
+					expectPodDoesNotExist(stagedB.Namespace, stagedB.Name)
+				},
+					Entry("after an eighteen-minute delay", 18*time.Minute),
+					Entry("after a forty-five-minute delay", 45*time.Minute),
+				)
+
+				It("Should preserve the intermediate helper when another incoming claim is requested", func() {
+					vmi, launcher, oldPod := newHandoff("vm-a", "disk-a", "disk-b")
+					reconcile(vmi, launcher)
+					testutils.ExpectEvent(recorder, kvcontroller.SuccessfulCreatePodReason)
+					Expect(createdPods).To(HaveLen(1))
+					stagedPod := createdPods[0]
+					Expect(controller.podIndexer.Add(stagedPod)).To(Succeed())
+					vmi.Spec.Volumes = append(vmi.Spec.Volumes, hotplugPVC("another-incoming"))
+					addBoundPVC("another-incoming")
+
+					for range 3 {
+						vmi = vmi.DeepCopy()
+						reconcile(vmi, launcher)
+						Expect(createdPods).To(HaveLen(1))
+						expectPodExists(stagedPod.Namespace, stagedPod.Name)
+						expectPodExists(oldPod.Namespace, oldPod.Name)
+					}
+					observeRunning(stagedPod)
+					Expect(controller.updateVolumeStatus(vmi, launcher, nil)).To(Succeed())
+					Expect(vmi.Status.VolumeStatus).To(ContainElement(And(
+						HaveField("Name", "vm-a-retained"), HaveField("Phase", virtv1.VolumeReady), HaveField("HotplugVolume.AttachPodUID", stagedPod.UID),
+					)))
+				})
+
+				It("Should preserve mounted utility volumes in the intermediate helper", func() {
+					vmi, launcher, _ := newHandoff("vm-a", "disk-a", "disk-b")
+					vmi.Spec.UtilityVolumes = []virtv1.UtilityVolume{{
+						Name:                              "vm-a-retained",
+						PersistentVolumeClaimVolumeSource: k8sv1.PersistentVolumeClaimVolumeSource{ClaimName: "vm-a-retained"},
+					}}
+					vmi.Spec.Volumes = vmi.Spec.Volumes[1:]
+					vmi.Status.VolumeStatus[0].Phase = virtv1.HotplugVolumeMounted
+
+					reconcile(vmi, launcher)
+					testutils.ExpectEvent(recorder, kvcontroller.SuccessfulCreatePodReason)
+					Expect(createdPods).To(HaveLen(1))
+					Expect(createdPods[0].Spec.Volumes).ToNot(ContainElement(HaveField("Name", "disk-b")))
+					observeRunning(createdPods[0])
+					Expect(controller.updateVolumeStatus(vmi, launcher, nil)).To(Succeed())
+					Expect(vmi.Status.VolumeStatus).To(ContainElement(And(
+						HaveField("Name", "vm-a-retained"), HaveField("Phase", virtv1.HotplugVolumeMounted), HaveField("HotplugVolume.AttachPodUID", createdPods[0].UID),
+					)))
+				})
+
+				It("Should not stage a retained volume using a different claim with the same volume name", func() {
+					vmi, launcher, oldPod := newHandoff("vm-a", "disk-a", "disk-b")
+					vmi.Spec.Volumes[0].PersistentVolumeClaim.ClaimName = "replacement"
+					addBoundPVC("replacement")
+
+					reconcile(vmi, launcher)
+					testutils.ExpectEvent(recorder, kvcontroller.SuccessfulCreatePodReason)
+					Expect(createdPods).To(HaveLen(1))
+					Expect(createdPods[0].Spec.Volumes).To(ContainElement(And(
+						HaveField("Name", "vm-a-retained"), HaveField("PersistentVolumeClaim.ClaimName", "replacement"),
+					)))
+					Expect(createdPods[0].Spec.Volumes).To(ContainElement(HaveField("Name", "disk-b")))
+					expectPodExists(oldPod.Namespace, oldPod.Name)
+				})
+			})
+
 			It("Should not count an old attachment pod serving another claim under the same name", func() {
 				vmi := newPendingVirtualMachine("testvmi")
 				vmi.Spec.Volumes = []virtv1.Volume{hotplugDataVolume("data")}
