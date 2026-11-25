@@ -22,6 +22,7 @@ package vmi
 import (
 	"errors"
 	"fmt"
+	"slices"
 	"sort"
 	"time"
 
@@ -68,15 +69,9 @@ func getActiveAndOldAttachmentPods(readyHotplugVolumes []*v1.Volume, hotplugAtta
 	return currentPod, oldPods
 }
 
-// cleanupAttachmentPods deletes all old attachment pods when the following is true
-// 1. There is a currentPod that is running. (not nil and phase.Status == Running)
-// 2. There are no readyVolumes (numReadyVolumes == 0)
-// 3. The newest oldPod is not running and not marked for deletion.
-// If any of those are true, it will not delete the newest oldPod, since that one is the latest
-// pod that is closest to the desired state.
+// cleanupAttachmentPods preserves useful running helpers until a replacement is
+// running, and never deletes helpers whose removed volumes are still mounted.
 func (c *Controller) cleanupAttachmentPods(currentPod *k8sv1.Pod, oldPods []*k8sv1.Pod, vmi *v1.VirtualMachineInstance, numReadyVolumes int) common.SyncError {
-	foundRunning := false
-
 	var statusMap = make(map[string]v1.VolumeStatus)
 	for _, vs := range vmi.Status.VolumeStatus {
 		if vs.HotplugVolume != nil {
@@ -97,12 +92,10 @@ func (c *Controller) cleanupAttachmentPods(currentPod *k8sv1.Pod, oldPods []*k8s
 
 	currentPodIsNotRunning := currentPod == nil || currentPod.Status.Phase != k8sv1.PodRunning
 	for _, attachmentPod := range oldPods {
-		if !foundRunning &&
-			attachmentPod.Status.Phase == k8sv1.PodRunning && attachmentPod.DeletionTimestamp == nil &&
+		if attachmentPod.Status.Phase == k8sv1.PodRunning && attachmentPod.DeletionTimestamp == nil &&
 			numReadyVolumes > 0 &&
 			currentPodIsNotRunning &&
 			podContainsVolumesToPreserve(attachmentPod, statusMap, specAttachmentVolumes) {
-			foundRunning = true
 			continue
 		}
 		volumesNotReadyForDelete := 0
@@ -221,6 +214,65 @@ func (c *Controller) isUtilityVolumeWithBlockPVC(vmi *v1.VirtualMachineInstance,
 	return storagetypes.IsPVCBlock(pvc.Spec.VolumeMode), nil
 }
 
+// Release outgoing claims before acquiring incoming claims that another VMI may
+// still hold. Reconstruct the intermediate set from running helpers, including
+// terminating helpers, until the old holders disappear.
+func volumesForAttachmentPod(vmi *v1.VirtualMachineInstance, readyVolumes []*v1.Volume, attachmentPods []*k8sv1.Pod) []*v1.Volume {
+	desiredNames := make(map[string]struct{})
+	for _, volume := range vmi.Spec.Volumes {
+		desiredNames[volume.Name] = struct{}{}
+	}
+	for _, volume := range vmi.Spec.UtilityVolumes {
+		desiredNames[volume.Name] = struct{}{}
+	}
+
+	removedNames := make(map[string]struct{})
+	for _, status := range vmi.Status.VolumeStatus {
+		if _, desired := desiredNames[status.Name]; !desired && status.HotplugVolume != nil {
+			removedNames[status.Name] = struct{}{}
+		}
+	}
+	if len(removedNames) == 0 {
+		return readyVolumes
+	}
+
+	readyClaims := make(map[string]string)
+	for _, volume := range readyVolumes {
+		readyClaims[volume.Name] = storagetypes.PVCNameFromVirtVolume(volume)
+	}
+	locallyServedNames := make(map[string]struct{})
+	hasOutgoingClaims := false
+	for _, pod := range attachmentPods {
+		if pod.Status.Phase != k8sv1.PodRunning || isTempPod(pod) {
+			continue
+		}
+		for _, podVolume := range pod.Spec.Volumes {
+			if podVolume.PersistentVolumeClaim == nil {
+				continue
+			}
+			if _, removed := removedNames[podVolume.Name]; removed {
+				hasOutgoingClaims = true
+			}
+			if _, desired := desiredNames[podVolume.Name]; !desired {
+				continue
+			}
+			if claim, ready := readyClaims[podVolume.Name]; !ready || claim != podVolume.PersistentVolumeClaim.ClaimName {
+				// Leave claim replacement to its existing migration handling.
+				return readyVolumes
+			}
+			locallyServedNames[podVolume.Name] = struct{}{}
+		}
+	}
+	if !hasOutgoingClaims || len(locallyServedNames) == 0 {
+		return readyVolumes
+	}
+
+	return slices.DeleteFunc(slices.Clone(readyVolumes), func(volume *v1.Volume) bool {
+		_, locallyServed := locallyServedNames[volume.Name]
+		return !locallyServed
+	})
+}
+
 func (c *Controller) handleHotplugVolumes(hotplugVolumes []*v1.Volume, hotplugAttachmentPods []*k8sv1.Pod, vmi *v1.VirtualMachineInstance, virtLauncherPod *k8sv1.Pod, dataVolumes []*cdiv1.DataVolume) common.SyncError {
 	logger := log.Log.Object(vmi)
 
@@ -257,6 +309,7 @@ func (c *Controller) handleHotplugVolumes(hotplugVolumes []*v1.Volume, hotplugAt
 		readyHotplugVolumes = append(readyHotplugVolumes, volume)
 	}
 
+	readyHotplugVolumes = volumesForAttachmentPod(vmi, readyHotplugVolumes, hotplugAttachmentPods)
 	currentPod, oldPods := getActiveAndOldAttachmentPods(readyHotplugVolumes, hotplugAttachmentPods)
 	if currentPod == nil && !hasPendingPods(oldPods) && len(readyHotplugVolumes) > 0 {
 		if rateLimited, waitTime := c.requeueAfter(oldPods, time.Duration(len(readyHotplugVolumes)/-10)); rateLimited {
